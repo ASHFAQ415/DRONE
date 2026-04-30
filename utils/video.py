@@ -132,8 +132,13 @@ def open_camera(index=0, width=VIDEO_WIDTH, height=VIDEO_HEIGHT):
         return init_rpi_camera(width, height)
 
     import cv2
+    source = index
+
+    if isinstance(source, str) and source.isdigit():
+        source = int(source)
+
     backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
-    capture = cv2.VideoCapture(index, backend)
+    capture = cv2.VideoCapture(source, backend)
     if not capture.isOpened():
         for alt_index in range(1, 4):
             capture = cv2.VideoCapture(alt_index, backend)

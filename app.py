@@ -21,8 +21,9 @@ from utils.video import get_simulated_frame, open_camera, get_webcam_frame, add_
 
 # ── Persistent webcam connection (survives Streamlit reruns) ────
 @st.cache_resource
-def init_camera(index=CAMERA_DEVICE_INDEX):
-    return open_camera(index)
+def init_camera(source=None):
+    """Initialize the webcam or RPi camera resource."""
+    return open_camera(source if source is not None else CAMERA_DEVICE_INDEX)
 
 
 @st.cache_resource
@@ -346,7 +347,6 @@ def main():
                     frame = get_simulated_frame()
                     live_dets = get_simulated_detection_data(8)
                     st.image(frame, use_column_width=True)
-
             # controls
             c1, c2, c3, c4 = st.columns(4)
             c1.button("📸 Capture",    use_container_width=True)
