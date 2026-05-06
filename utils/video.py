@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 from datetime import datetime
 
-from config import VIDEO_WIDTH, VIDEO_HEIGHT, DETECTION_COLORS
+from config import VIDEO_WIDTH, VIDEO_HEIGHT, CAMERA_FPS, DETECTION_COLORS
 
 # ── Try importing picamera2 (only available on RPi) ─────────────
 try:
@@ -97,7 +97,7 @@ def add_detection_overlay(img, boxes=None):
 
 # ── Raspberry Pi Camera (ArduCam IMX219-R via picamera2) ────────
 
-def init_rpi_camera(width=VIDEO_WIDTH, height=VIDEO_HEIGHT):
+def init_rpi_camera(width=VIDEO_WIDTH, height=VIDEO_HEIGHT, fps=CAMERA_FPS):
     """
     Initialize the ArduCam IMX219-R via picamera2.
     Call once and cache with @st.cache_resource in app.py.
@@ -107,10 +107,18 @@ def init_rpi_camera(width=VIDEO_WIDTH, height=VIDEO_HEIGHT):
         return None
 
     picam = Picamera2()
-    config = picam.create_preview_configuration(
-        main={"size": (width, height), "format": "RGB888"},
-        display={"size": (width, height)},
-    )
+    frame_time_us = int(1_000_000 / max(1, fps))
+    try:
+        config = picam.create_video_configuration(
+            main={"size": (width, height), "format": "RGB888"},
+            buffer_count=2,
+            controls={"FrameDurationLimits": (frame_time_us, frame_time_us)},
+        )
+    except TypeError:
+        config = picam.create_preview_configuration(
+            main={"size": (width, height), "format": "RGB888"},
+            display={"size": (width, height)},
+        )
     picam.configure(config)
     picam.start()
     return picam
@@ -126,10 +134,10 @@ def get_rpi_camera_frame(picam):
 
 # ── Webcam support (for development on PC) ──────────────────────
 
-def open_camera(index=0, width=VIDEO_WIDTH, height=VIDEO_HEIGHT):
+def open_camera(index=0, width=VIDEO_WIDTH, height=VIDEO_HEIGHT, fps=CAMERA_FPS):
     """Open camera by index. On RPi, returns RPi camera; on PC, returns OpenCV capture."""
     if RPI_CAMERA_AVAILABLE:
-        return init_rpi_camera(width, height)
+        return init_rpi_camera(width, height, fps)
 
     import cv2
     source = index
@@ -147,9 +155,14 @@ def open_camera(index=0, width=VIDEO_WIDTH, height=VIDEO_HEIGHT):
         else:
             return None
 
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    try:
+        capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    except Exception:
+        pass
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    capture.set(cv2.CAP_PROP_FPS, 30)
+    capture.set(cv2.CAP_PROP_FPS, fps)
     return capture
 
 

@@ -13,17 +13,32 @@ import numpy as np
 import time
 from datetime import datetime
 
-from config import DRONE_CONFIG, DETECTION_COLORS, REFRESH_INTERVAL, DEFAULT_CONFIDENCE, CAMERA_DEVICE_INDEX
+from config import (
+    DRONE_CONFIG,
+    DETECTION_COLORS,
+    REFRESH_INTERVAL,
+    DEFAULT_CONFIDENCE,
+    CAMERA_DEVICE_INDEX,
+    VIDEO_WIDTH,
+    VIDEO_HEIGHT,
+    CAMERA_FPS,
+    CAMERA_INFERENCE_EVERY_N,
+)
 from utils.telemetry import get_telemetry_data, get_telemetry_history
-from utils.detection import infer_detections, get_detection_summary, get_simulated_detection_data, load_yolo_model
+from utils.detection import infer_detections, get_detection_summary, get_simulated_detection_data, load_yolo_model, get_model_backend
 from utils.video import get_simulated_frame, open_camera, get_webcam_frame, add_detection_overlay, RPI_CAMERA_AVAILABLE
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 
 # ── Persistent webcam connection (survives Streamlit reruns) ────
 @st.cache_resource
-def init_camera(source=None):
+def init_camera(source=None, width=VIDEO_WIDTH, height=VIDEO_HEIGHT, fps=CAMERA_FPS):
     """Initialize the webcam or RPi camera resource."""
-    return open_camera(source if source is not None else CAMERA_DEVICE_INDEX)
+    return open_camera(source if source is not None else CAMERA_DEVICE_INDEX, width, height, fps)
 
 
 @st.cache_resource
@@ -32,6 +47,26 @@ def init_yolo_model():
         return load_yolo_model()
     except Exception:
         return None
+
+
+def update_live_detections(frame, model, conf_threshold, infer_every_n):
+    """Run AI periodically so the Pi can keep camera capture responsive."""
+    st.session_state.feed_frame_count += 1
+    previous = st.session_state.get("last_live_dets")
+    confidence_changed = st.session_state.get("last_conf_threshold") != conf_threshold
+    first_frame = previous is None or previous.empty
+    should_infer = first_frame or confidence_changed or st.session_state.feed_frame_count % max(1, infer_every_n) == 0
+
+    if model is None:
+        live_dets = get_simulated_detection_data(8)
+    elif should_infer:
+        live_dets = infer_detections(frame, model=model, conf_threshold=conf_threshold)
+    else:
+        live_dets = previous
+
+    st.session_state.last_conf_threshold = conf_threshold
+    st.session_state.last_live_dets = live_dets
+    return live_dets
 
 
 def main():
@@ -203,9 +238,22 @@ def main():
         detect_drone   = st.checkbox("Drone",   value=True)
 
         st.markdown("---")
+        st.markdown("#### 📹 Camera Performance")
+        camera_profiles = {
+            "Lowest": (VIDEO_WIDTH, VIDEO_HEIGHT, CAMERA_FPS, CAMERA_INFERENCE_EVERY_N),
+            "Ultra Fast": (224, 168, 10, 6),
+            "Faster": (320, 240, 10, 4),
+            "Quality": (480, 360, 15, 2),
+        }
+        profile_name = st.selectbox("Camera Mode", list(camera_profiles), index=0)
+        stream_width, stream_height, stream_fps, infer_every_n = camera_profiles[profile_name]
+        st.caption(f"{stream_width}x{stream_height} @ {stream_fps} FPS  ·  AI every {infer_every_n} frame(s)")
+
+        st.markdown("---")
         st.markdown("#### 🔄 Refresh")
-        auto_refresh = st.toggle("Auto-refresh", value=False)
-        if st.button("↻  Refresh Now", use_container_width=True):
+        auto_refresh = st.toggle("Live refresh", value=True)
+        refresh_interval = st.slider("Refresh interval (s)", 0.5, 5.0, float(REFRESH_INTERVAL), 0.25)
+        if st.button("↻  Refresh Now", width="stretch"):
             st.rerun()
 
 
@@ -216,7 +264,7 @@ def main():
     <div class="hero-banner">
         <div>
             <h1>🛸 DroneAI Command Center</h1>
-            <div class="subtitle">Real-time Autonomous Surveillance  ·  RPi 5 + Hailo-8L</div>
+            <div class="subtitle">Real-time Autonomous Surveillance  ·  Raspberry Pi 4 + ONNX Runtime</div>
         </div>
         <span class="badge-online">SYSTEM ONLINE</span>
     </div>
@@ -235,6 +283,8 @@ def main():
     model      = init_yolo_model()
     live_dets  = pd.DataFrame(columns=["timestamp", "class", "confidence", "x", "y", "width", "height"])
     summary    = get_detection_summary(live_dets)
+    st.session_state.setdefault("feed_frame_count", 0)
+    st.session_state.setdefault("last_live_dets", live_dets)
 
 
     # ┌──────────────────────────────────────────────────────────────┐
@@ -261,7 +311,7 @@ def main():
                 "lat": [telemetry["gps_lat"]],
                 "lon": [telemetry["gps_lon"]],
             })
-            st.map(map_df, zoom=15, use_container_width=True)
+            st.map(map_df, zoom=15, width="stretch")
 
         with col_info:
             st.markdown('<div class="section-title">📋 Flight Info</div>', unsafe_allow_html=True)
@@ -269,7 +319,7 @@ def main():
             info_data = {
                 "Parameter": [
                     "Flight Mode", "Armed", "Heading", "GPS Lat", "GPS Lon",
-                    "AI Model", "Inference FPS", "Uptime",
+                    "AI Runtime", "Model Backend", "Uptime",
                 ],
                 "Value": [
                     flight_mode,
@@ -277,8 +327,8 @@ def main():
                     f"{telemetry['heading']}°",
                     f"{telemetry['gps_lat']:.6f}",
                     f"{telemetry['gps_lon']:.6f}",
-                    "YOLOv8n (Hailo-8L)",
-                    f"{np.random.randint(25, 30)}",
+                    DRONE_CONFIG["ai_runtime"],
+                    get_model_backend(),
                     f"{np.random.randint(5, 55)} min",
                 ],
             }
@@ -306,17 +356,18 @@ def main():
             # ── source toggle ──
             if RPI_CAMERA_AVAILABLE:
                 st.markdown('<div class="section-title">📹 Live ArduCam IMX219-R Feed</div>', unsafe_allow_html=True)
-                cam = init_camera()
+                cam = init_camera(width=stream_width, height=stream_height, fps=stream_fps)
                 frame = get_webcam_frame(cam)
                 if frame is not None:
                     if model is not None:
-                        live_dets = infer_detections(frame, model=model, conf_threshold=conf_threshold)
+                        live_dets = update_live_detections(frame, model, conf_threshold, infer_every_n)
                     else:
-                        st.warning("YOLOv8 model unavailable, using simulated detections.")
+                        st.warning(f"AI model unavailable ({get_model_backend()}), using simulated detections.")
                         live_dets = get_simulated_detection_data(8)
+                        st.session_state.last_live_dets = live_dets
 
                     frame = add_detection_overlay(frame, live_dets)
-                    st.image(frame, use_column_width=True)
+                    st.image(frame, width="stretch")
                 else:
                     st.error("⚠️ Unable to capture live ArduCam feed. Verify picamera2 installation and camera connection.")
                     st.info("If the camera is attached to the Raspberry Pi, restart the app after installing picamera2.")
@@ -325,34 +376,35 @@ def main():
 
                 if use_webcam:
                     st.markdown('<div class="section-title">📹 Live Webcam Feed</div>', unsafe_allow_html=True)
-                    cam = init_camera()
+                    cam = init_camera(width=stream_width, height=stream_height, fps=stream_fps)
                     frame = get_webcam_frame(cam)
                     if frame is not None:
                         if model is not None:
-                            live_dets = infer_detections(frame, model=model, conf_threshold=conf_threshold)
+                            live_dets = update_live_detections(frame, model, conf_threshold, infer_every_n)
                         else:
-                            st.warning("YOLOv8 model unavailable, using simulated detections.")
+                            st.warning(f"AI model unavailable ({get_model_backend()}), using simulated detections.")
                             live_dets = get_simulated_detection_data(8)
+                            st.session_state.last_live_dets = live_dets
 
                         frame = add_detection_overlay(frame, live_dets)
-                        st.image(frame, use_column_width=True)
+                        st.image(frame, width="stretch")
                     else:
                         st.error("⚠️ Webcam capture failed. Ensure a webcam is connected and not in use by another app.")
                         st.markdown('<div class="section-title">📹 Camera Feed (Simulated)</div>', unsafe_allow_html=True)
                         frame = get_simulated_frame()
                         live_dets = get_simulated_detection_data(8)
-                        st.image(frame, use_column_width=True)
+                        st.image(frame, width="stretch")
                 else:
                     st.markdown('<div class="section-title">📹 Camera Feed (Simulated)</div>', unsafe_allow_html=True)
                     frame = get_simulated_frame()
                     live_dets = get_simulated_detection_data(8)
-                    st.image(frame, use_column_width=True)
+                    st.image(frame, width="stretch")
             # controls
             c1, c2, c3, c4 = st.columns(4)
-            c1.button("📸 Capture",    use_container_width=True)
-            c2.button("⏺️ Record",     use_container_width=True)
-            c3.button("🔍 Zoom In",    use_container_width=True)
-            c4.button("🌙 Night Mode", use_container_width=True)
+            c1.button("📸 Capture",    width="stretch")
+            c2.button("⏺️ Record",     width="stretch")
+            c3.button("🔍 Zoom In",    width="stretch")
+            c4.button("🌙 Night Mode", width="stretch")
 
         with col_live_det:
             st.markdown('<div class="section-title">🎯 Live Detections</div>', unsafe_allow_html=True)
@@ -395,7 +447,7 @@ def main():
                 title_font_color="#e6edf3",
                 legend_font_color="#8b949e",
             )
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_pie, width="stretch")
 
         with d_col2:
             fig_hist = px.histogram(
@@ -413,7 +465,7 @@ def main():
                 xaxis_title="Confidence",
                 yaxis_title="Count",
             )
-            st.plotly_chart(fig_hist, use_container_width=True)
+            st.plotly_chart(fig_hist, width="stretch")
 
         # -- detection timeline -----------------------------------------
         st.markdown('<div class="section-title">📋 Detection Log</div>', unsafe_allow_html=True)
@@ -457,13 +509,13 @@ def main():
             fig = px.area(history, x="timestamp", y="altitude", title="Altitude (m)",
                            color_discrete_sequence=["#00ff88"])
             fig.update_layout(**CHART_LAYOUT)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         with a2:
             fig = px.line(history, x="timestamp", y="speed", title="Speed (m/s)",
                           color_discrete_sequence=["#4d96ff"])
             fig.update_layout(**CHART_LAYOUT)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         a3, a4 = st.columns(2)
 
@@ -472,13 +524,13 @@ def main():
                           color_discrete_sequence=["#ffd93d"])
             fig.update_layout(**CHART_LAYOUT)
             fig.update_yaxes(range=[0, 100])
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         with a4:
             fig = px.line(history, x="timestamp", y="temperature", title="Temperature (°C)",
                           color_discrete_sequence=["#ff6b6b"])
             fig.update_layout(**CHART_LAYOUT)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         # -- detection trend (bar) --------------------------------------
         st.markdown('<div class="section-title">🎯 Detection Counts by Class</div>', unsafe_allow_html=True)
@@ -493,7 +545,7 @@ def main():
             title="Current Session Detections",
         )
         fig_bar.update_layout(**CHART_LAYOUT, showlegend=False)
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, width="stretch")
 
 
     # ┌──────────────────────────────────────────────────────────────┐
@@ -510,7 +562,7 @@ def main():
                     "Flight Controller", "Battery", "Max Altitude", "Max Speed",
                 ],
                 "Specification": [
-                    "Raspberry Pi 5 (8 GB)",
+                    DRONE_CONFIG["processor"],
                     DRONE_CONFIG["ai_accelerator"],
                     DRONE_CONFIG["camera"],
                     DRONE_CONFIG["flight_controller"],
@@ -523,10 +575,20 @@ def main():
 
         with s2:
             st.markdown('<div class="section-title">📊 System Resources</div>', unsafe_allow_html=True)
-            cpu_usage = np.random.randint(35, 65)
-            ram_usage = np.random.randint(40, 70)
-            disk_usage = np.random.randint(25, 50)
-            gpu_usage = np.random.randint(50, 85)
+            if psutil is not None:
+                cpu_usage = int(psutil.cpu_percent(interval=0.1))
+                ram_usage = int(psutil.virtual_memory().percent)
+                disk_usage = int(psutil.disk_usage("/").percent)
+                try:
+                    temp = psutil.sensors_temperatures().get("cpu_thermal", [None])[0]
+                    cpu_temp = f"{temp.current:.1f}°C" if temp is not None else "N/A"
+                except Exception:
+                    cpu_temp = "N/A"
+            else:
+                cpu_usage = np.random.randint(35, 65)
+                ram_usage = np.random.randint(40, 70)
+                disk_usage = np.random.randint(25, 50)
+                cpu_temp = "N/A"
 
             res1, res2 = st.columns(2)
             res1.metric("CPU", f"{cpu_usage}%")
@@ -534,7 +596,7 @@ def main():
 
             res3, res4 = st.columns(2)
             res3.metric("Disk", f"{disk_usage}%")
-            res4.metric("Hailo NPU", f"{gpu_usage}%")
+            res4.metric("CPU Temp", cpu_temp)
 
             st.markdown("")
             st.markdown('<div class="section-title">📡 Network</div>', unsafe_allow_html=True)
@@ -554,7 +616,7 @@ def main():
     # ║  AUTO REFRESH                                                ║
     # ╚══════════════════════════════════════════════════════════════╝
     if auto_refresh:
-        time.sleep(REFRESH_INTERVAL)
+        time.sleep(refresh_interval)
         st.rerun()
 
 if __name__ == "__main__":
