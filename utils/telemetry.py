@@ -5,7 +5,6 @@ Replace the simulation functions with real MAVLink reads when connecting to hard
 
 import time
 import numpy as np
-import pandas as pd
 from datetime import datetime, timedelta
 
 from config import HOME_POSITION
@@ -30,8 +29,10 @@ def get_telemetry_data() -> dict:
     }
 
 
-def get_telemetry_history(minutes: int = 30) -> pd.DataFrame:
+def get_telemetry_history(minutes: int = 30):
     """Generate *minutes* worth of simulated telemetry history (1 sample / 2 s)."""
+    import pandas as pd
+
     now = datetime.now()
     n_points = minutes * 30  # one sample every 2 seconds
     timestamps = [now - timedelta(seconds=i * 2) for i in range(n_points)]

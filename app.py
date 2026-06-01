@@ -1,623 +1,868 @@
 """
-DroneAI Command Center — Streamlit Dashboard
-=============================================
-Main entry point.  Run with:
-    streamlit run app.py
+DroneAI lightweight operator UI with continuous live video stream.
+
+Run with:
+    python app.py
+
+Provides two video modes:
+  /stream   — Continuous MJPEG live feed with real-time YOLO detection
+              (like the Object_Detection_Files while True loop)
+  /snapshot.jpg — Single JPEG capture (legacy, still available)
+
+The camera runs continuously in a background thread, capturing frames
+and running YOLOv8n inference. Detection results trigger servo actuation
+when target objects are found (object-ident-3.py style).
 """
 
-import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
-import pandas as pd
-import numpy as np
+from __future__ import annotations
+
+import html
+import io
+import json
+import logging
+import os
+import signal
+import threading
 import time
-from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, quote, urlparse
 
 from config import (
-    DRONE_CONFIG,
-    DETECTION_COLORS,
-    REFRESH_INTERVAL,
-    DEFAULT_CONFIDENCE,
     CAMERA_DEVICE_INDEX,
-    VIDEO_WIDTH,
-    VIDEO_HEIGHT,
     CAMERA_FPS,
     CAMERA_INFERENCE_EVERY_N,
+    DEFAULT_CONFIDENCE,
+    DRONE_CONFIG,
+    VIDEO_HEIGHT,
+    VIDEO_WIDTH,
 )
-from utils.telemetry import get_telemetry_data, get_telemetry_history
-from utils.detection import infer_detections, get_detection_summary, get_simulated_detection_data, load_yolo_model, get_model_backend
-from utils.video import get_simulated_frame, open_camera, get_webcam_frame, add_detection_overlay, RPI_CAMERA_AVAILABLE
+from utils.detection import (
+    PersonTargetTracker,
+    get_detection_summary,
+    get_model_backend,
+    infer_detections,
+    load_yolo_model,
+)
+from utils.servo import release_servo, stop_servo, track_target
+from utils.telemetry import get_telemetry_data
+from utils.video import (
+    add_detection_overlay,
+    camera_error_hint,
+    get_camera_backend_name,
+    get_camera_frame,
+    get_camera_status,
+    get_simulated_frame,
+    open_camera,
+    release_camera,
+)
 
-try:
-    import psutil
-except ImportError:
-    psutil = None
+logger = logging.getLogger(__name__)
+
+HOST = os.getenv("DRONE_UI_HOST", "0.0.0.0")
+PORT = int(os.getenv("DRONE_UI_PORT", "8501"))
+CAMERA_BACKEND = os.getenv("DRONE_CAMERA_BACKEND", "auto").strip().lower()
+AI_ENABLED = True
+OVERLAY_ENABLED = True
+
+# ── Shared state for continuous capture loop ────────────────────
+_CAMERA_LOCK = threading.Lock()
+_CAMERA = None
+_CAMERA_KEY = None
+_MODEL = None
+_MODEL_LOCK = threading.Lock()
+
+# Latest frame + detections, updated by background thread
+_FRAME_LOCK = threading.Lock()
+_LATEST_JPEG = None          # bytes — most recent JPEG with overlay
+_LATEST_DETECTIONS = []      # list[dict] — most recent detection results
+_FRAME_EVENT = threading.Event()  # signaled when a new frame is ready
+
+# Stream settings (can be changed via query params)
+_STREAM_SETTINGS_LOCK = threading.Lock()
+_STREAM_AI_ENABLED = AI_ENABLED
+_STREAM_OVERLAY_ENABLED = OVERLAY_ENABLED
+_STREAM_CONFIDENCE = DEFAULT_CONFIDENCE
+_STREAM_TARGET_ID = "auto"  # Default to auto-tracking first detected target
+_PERSON_TRACKER = PersonTargetTracker()
+
+# Background capture loop control
+_CAPTURE_THREAD = None
+_INFERENCE_THREAD = None
+_CAPTURE_RUNNING = False
+
+# Inference offloading state
+_INFERENCE_FRAME = None
+_INFERENCE_FRAME_EVENT = threading.Event()
 
 
-# ── Persistent webcam connection (survives Streamlit reruns) ────
-@st.cache_resource
-def init_camera(source=None, width=VIDEO_WIDTH, height=VIDEO_HEIGHT, fps=CAMERA_FPS):
-    """Initialize the webcam or RPi camera resource."""
-    return open_camera(source if source is not None else CAMERA_DEVICE_INDEX, width, height, fps)
-
-
-@st.cache_resource
-def init_yolo_model():
+def _float_param(params: dict[str, list[str]], name: str, default: float) -> float:
     try:
-        return load_yolo_model()
-    except Exception:
-        return None
+        return float(params.get(name, [str(default)])[0])
+    except (TypeError, ValueError):
+        return default
 
 
-def update_live_detections(frame, model, conf_threshold, infer_every_n):
-    """Run AI periodically so the Pi can keep camera capture responsive."""
-    st.session_state.feed_frame_count += 1
-    previous = st.session_state.get("last_live_dets")
-    confidence_changed = st.session_state.get("last_conf_threshold") != conf_threshold
-    first_frame = previous is None or previous.empty
-    should_infer = first_frame or confidence_changed or st.session_state.feed_frame_count % max(1, infer_every_n) == 0
+def _get_camera():
+    global _CAMERA, _CAMERA_KEY
+    camera_key = (CAMERA_DEVICE_INDEX, VIDEO_WIDTH, VIDEO_HEIGHT,
+                  CAMERA_FPS, CAMERA_BACKEND)
+    with _CAMERA_LOCK:
+        if _CAMERA_KEY != camera_key:
+            release_camera(_CAMERA)
+            _CAMERA = open_camera(
+                CAMERA_DEVICE_INDEX,
+                VIDEO_WIDTH,
+                VIDEO_HEIGHT,
+                CAMERA_FPS,
+                backend=CAMERA_BACKEND,
+            )
+            _CAMERA_KEY = camera_key
+        return _CAMERA
 
-    if model is None:
-        live_dets = get_simulated_detection_data(8)
-    elif should_infer:
-        live_dets = infer_detections(frame, model=model, conf_threshold=conf_threshold)
-    else:
-        live_dets = previous
 
-    st.session_state.last_conf_threshold = conf_threshold
-    st.session_state.last_live_dets = live_dets
-    return live_dets
+def _reset_camera():
+    global _CAMERA, _CAMERA_KEY
+    with _CAMERA_LOCK:
+        release_camera(_CAMERA)
+        _CAMERA = None
+        _CAMERA_KEY = None
 
+
+def _get_model():
+    global _MODEL
+    with _MODEL_LOCK:
+        if _MODEL is None:
+            _MODEL = load_yolo_model()
+        return _MODEL
+
+
+def _jpeg_bytes(frame) -> bytes:
+    output = io.BytesIO()
+    frame.save(output, format="JPEG", quality=78, optimize=True)
+    return output.getvalue()
+
+
+def _get_frame_size(frame):
+    """Return (width, height) from a PIL Image or fall back to config defaults."""
+    if hasattr(frame, "size"):
+        return frame.size          # PIL Image: (width, height)
+    return (VIDEO_WIDTH, VIDEO_HEIGHT)
+
+
+def _inference_loop():
+    global _LATEST_DETECTIONS, _INFERENCE_FRAME
+
+    logger.info("Inference loop started")
+    while _CAPTURE_RUNNING:
+        _INFERENCE_FRAME_EVENT.wait(timeout=1.0)
+        _INFERENCE_FRAME_EVENT.clear()
+
+        with _FRAME_LOCK:
+            frame_to_process = _INFERENCE_FRAME
+
+        if frame_to_process is None:
+            continue
+
+        with _STREAM_SETTINGS_LOCK:
+            confidence = _STREAM_CONFIDENCE
+            target_id = _STREAM_TARGET_ID
+
+        try:
+            dets = infer_detections(
+                frame_to_process, model=_get_model(),
+                conf_threshold=confidence,
+            )
+            # Only update tracker when we have a specific locked ID
+            if target_id and target_id != "auto":
+                dets = _PERSON_TRACKER.update(dets, locked_target_id=target_id)
+            else:
+                dets = _PERSON_TRACKER.update(dets)
+
+            frame_w, frame_h = _get_frame_size(frame_to_process)
+            target_visible = False
+
+            if not target_id:
+                # "None (Static)" — servo holds position
+                pass
+
+            elif target_id == "auto":
+                # Auto-track: prefer Person, then any trackable detection
+                # Mirrors reference repo which always follows the first object
+                preferred = [d for d in dets if d.get("class") == "Person"]
+                pick = (preferred or dets or [None])[0]
+                if pick is not None:
+                    target_visible = True
+                    pick["target_selected"] = True
+                    x_c = pick["x"] + pick["width"] / 2.0
+                    y_c = pick["y"] + pick["height"] / 2.0
+                    track_target(x_c, frame_w, y_c, frame_h)
+
+            else:
+                # Specific locked target by ID
+                matches = [d for d in dets if d.get("target_id") == target_id]
+                if matches:
+                    target_visible = True
+                    best = matches[0]
+                    best["target_selected"] = True
+                    x_c = best["x"] + best["width"] / 2.0
+                    y_c = best["y"] + best["height"] / 2.0
+                    track_target(x_c, frame_w, y_c, frame_h)
+
+            # If we expected a target but didn't see one, tell servo
+            if target_id and not target_visible:
+                stop_servo()
+
+        except Exception:
+            logger.exception("Inference failed")
+            stop_servo()
+            dets = []
+
+        with _FRAME_LOCK:
+            _LATEST_DETECTIONS = dets
+
+
+def _capture_loop():
+    """Background thread: continuously capture frames + trigger YOLO detection."""
+    global _LATEST_JPEG, _LATEST_DETECTIONS, _CAPTURE_RUNNING, _INFERENCE_FRAME, _INFERENCE_FRAME_EVENT
+
+    frame_count = 0
+    last_frame_time = time.monotonic()
+
+    logger.info("Continuous capture loop started")
+
+    while _CAPTURE_RUNNING:
+        loop_start = time.monotonic()
+
+        # Read current stream settings
+        with _STREAM_SETTINGS_LOCK:
+            ai_enabled = _STREAM_AI_ENABLED
+            overlay_enabled = _STREAM_OVERLAY_ENABLED
+
+        # Capture frame
+        cam = _get_camera()
+        frame = get_camera_frame(cam)
+        simulated = False
+
+        if frame is None:
+            frame = get_simulated_frame(VIDEO_WIDTH, VIDEO_HEIGHT)
+            simulated = True
+
+        # Run YOLO detection asynchronously (every Nth frame)
+        frame_count += 1
+        if ai_enabled and frame_count % max(1, CAMERA_INFERENCE_EVERY_N) == 0:
+            with _FRAME_LOCK:
+                _INFERENCE_FRAME = frame.copy() if hasattr(frame, 'copy') else frame
+            _INFERENCE_FRAME_EVENT.set()
+        elif not ai_enabled:
+            with _FRAME_LOCK:
+                _LATEST_DETECTIONS = []
+            stop_servo()
+
+        with _FRAME_LOCK:
+            last_detections = _LATEST_DETECTIONS
+
+        # Apply HUD overlay with detection boxes
+        if overlay_enabled and not simulated:
+            frame_elapsed = max(0.001, loop_start - last_frame_time)
+            display_fps = 1.0 / frame_elapsed
+            frame = add_detection_overlay(
+                frame,
+                last_detections if ai_enabled else [],
+                fps=display_fps,
+            )
+
+        # Encode to JPEG and store
+        jpeg = _jpeg_bytes(frame)
+        with _FRAME_LOCK:
+            _LATEST_JPEG = jpeg
+        _FRAME_EVENT.set()
+
+        # Throttle to target FPS, accounting for processing time
+        target_sleep = 1.0 / max(1, CAMERA_FPS)
+        elapsed = time.monotonic() - last_frame_time
+        sleep_time = max(0.001, target_sleep - elapsed)
+        time.sleep(sleep_time)
+        last_frame_time = time.monotonic()
+
+    logger.info("Continuous capture loop stopped")
+
+
+def _start_capture_loop():
+    global _CAPTURE_THREAD, _INFERENCE_THREAD, _CAPTURE_RUNNING
+    if _CAPTURE_THREAD is not None and _CAPTURE_THREAD.is_alive():
+        return
+    _CAPTURE_RUNNING = True
+    
+    _INFERENCE_THREAD = threading.Thread(
+        target=_inference_loop, daemon=True, name="inference-loop"
+    )
+    _INFERENCE_THREAD.start()
+    
+    _CAPTURE_THREAD = threading.Thread(
+        target=_capture_loop, daemon=True, name="capture-loop"
+    )
+    _CAPTURE_THREAD.start()
+
+
+def _stop_capture_loop():
+    global _CAPTURE_RUNNING
+    _CAPTURE_RUNNING = False
+
+
+def _update_stream_settings(ai_enabled: bool, overlay_enabled: bool,
+                            confidence: float, target_id: str):
+    global _STREAM_AI_ENABLED, _STREAM_OVERLAY_ENABLED, _STREAM_CONFIDENCE, _STREAM_TARGET_ID
+    with _STREAM_SETTINGS_LOCK:
+        _STREAM_AI_ENABLED = ai_enabled
+        _STREAM_OVERLAY_ENABLED = overlay_enabled
+        _STREAM_CONFIDENCE = confidence
+        _STREAM_TARGET_ID = target_id
+
+
+# ── Status & HTML rendering ────────────────────────────────────
+
+def _status_rows(telemetry: dict, ai_enabled: bool) -> list[tuple[str, str]]:
+    det_summary = ""
+    target_label = "None"
+    with _FRAME_LOCK:
+        dets = _LATEST_DETECTIONS
+    if dets:
+        summary = get_detection_summary(dets)
+        det_summary = ", ".join(
+            f"{cls}: {count}" for cls, count in summary.items() if count > 0
+        ) or "none"
+        
+    with _STREAM_SETTINGS_LOCK:
+        target_id = _STREAM_TARGET_ID
+
+    if target_id == "auto":
+        target_label = "Auto-Track (First Detected)"
+    elif target_id:
+        target_label = _target_label_for_id(target_id, dets) or f"{target_id} (not visible)"
+        
+    return [
+        ("Camera backend", get_camera_backend_name()),
+        ("Camera status", get_camera_status() or "OK"),
+        ("AI", "on" if ai_enabled else "off"),
+        ("Tracking Target", target_label),
+        ("Model", get_model_backend()),
+        ("Detections", det_summary or "—"),
+        ("Armed", "yes" if telemetry["armed"] else "no"),
+        ("GPS", f"{telemetry['gps_lat']:.6f}, {telemetry['gps_lon']:.6f}"),
+        ("Heading", f"{telemetry['heading']} deg"),
+    ]
+
+
+def _target_options(selected_target_id: str) -> list[tuple[str, str]]:
+    with _FRAME_LOCK:
+        dets = list(_LATEST_DETECTIONS)
+
+    options = []
+    seen = set()
+    for det in sorted(
+        dets,
+        key=lambda d: (d.get("target_label", ""), d.get("x", 0), d.get("y", 0)),
+    ):
+        target_id = det.get("target_id")
+        target_label = det.get("target_label")
+        if not target_id or not target_label or target_id in seen:
+            continue
+        options.append((target_id, target_label))
+        seen.add(target_id)
+
+    if selected_target_id and selected_target_id not in seen and selected_target_id != "auto":
+        options.append((selected_target_id, f"{selected_target_id} (not visible)"))
+
+    return options
+
+
+def _target_label_for_id(target_id: str, detections: list[dict]) -> str:
+    for det in detections:
+        if det.get("target_id") == target_id:
+            return det.get("target_label", target_id)
+    return ""
+
+
+def _targets_payload() -> bytes:
+    with _STREAM_SETTINGS_LOCK:
+        selected_target_id = _STREAM_TARGET_ID
+    payload = {
+        "selected": selected_target_id,
+        "targets": [
+            {"id": "auto", "label": "Auto-Track (First Detected)"}
+        ] + [
+            {"id": target_id, "label": target_label}
+            for target_id, target_label in _target_options(selected_target_id)
+            if target_id != "auto"
+        ],
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def _render_html(params: dict[str, list[str]]) -> bytes:
+    telemetry = get_telemetry_data()
+    ai_enabled = AI_ENABLED
+    overlay_enabled = OVERLAY_ENABLED
+    confidence = _float_param(params, "conf", DEFAULT_CONFIDENCE)
+    
+    with _STREAM_SETTINGS_LOCK:
+        current_target = _STREAM_TARGET_ID
+    target_id = params.get("target", [current_target])[-1].strip()
+    
+    status = get_camera_status()
+    hint = camera_error_hint(status)
+
+    # Update background loop settings from the form
+    _update_stream_settings(ai_enabled, overlay_enabled, confidence, target_id)
+
+    query = f"conf={confidence:.2f}&target={quote(target_id)}"
+    rows = "\n".join(
+        f"<tr><th>{html.escape(label)}</th>"
+        f"<td>{html.escape(value)}</td></tr>"
+        for label, value in _status_rows(telemetry, ai_enabled)
+    )
+
+    hint_html = (
+        f'<p class="hint">{html.escape(hint)}</p>' if hint else ""
+    )
+    
+    # Generate target dropdown options
+    target_options = ""
+    auto_selected = "selected" if target_id == "auto" else ""
+    target_options += f'<option value="auto" {auto_selected}>Auto-Track (First Detected)</option>'
+    
+    none_selected = "selected" if target_id == "" else ""
+    target_options += f'<option value="" {none_selected}>None (Static)</option>'
+    
+    for option_id, option_label in _target_options(target_id):
+        if option_id == "auto":
+            continue
+        selected = "selected" if option_id == target_id else ""
+        target_options += (
+            f'<option value="{html.escape(option_id)}" {selected}>'
+            f'{html.escape(option_label)}</option>'
+        )
+        
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DroneAI — Live Feed</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      font-family: Arial, Helvetica, sans-serif;
+      background: #101418;
+      color: #eef3f7;
+    }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      background: #101418;
+    }}
+    main {{
+      width: min(980px, calc(100vw - 24px));
+      margin: 0 auto;
+      padding: 16px 0 28px;
+    }}
+    header {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-end;
+      border-bottom: 1px solid #26313a;
+      padding-bottom: 12px;
+      margin-bottom: 14px;
+    }}
+    h1 {{
+      font-size: 1.35rem;
+      line-height: 1.2;
+      margin: 0;
+    }}
+    .live-badge {{
+      display: inline-block;
+      background: #e53e3e;
+      color: #fff;
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 3px;
+      margin-left: 8px;
+      animation: pulse 1.5s ease-in-out infinite;
+    }}
+    @keyframes pulse {{
+      0%, 100% {{ opacity: 1; }}
+      50% {{ opacity: 0.5; }}
+    }}
+    .sub {{
+      margin: 4px 0 0;
+      color: #9bacb8;
+      font-size: 0.88rem;
+    }}
+    .frame {{
+      display: block;
+      width: auto;
+      max-width: 100%;
+      height: auto;
+      max-height: 72vh;
+      margin: 0 auto;
+      aspect-ratio: {VIDEO_WIDTH} / {VIDEO_HEIGHT};
+      object-fit: contain;
+      background: #050607;
+      border: 1px solid #26313a;
+      border-radius: 6px;
+    }}
+    .metrics {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin: 12px 0;
+    }}
+    .metric {{
+      background: #171e24;
+      border: 1px solid #26313a;
+      border-radius: 6px;
+      padding: 10px;
+    }}
+    .label {{
+      color: #9bacb8;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+    }}
+    .value {{
+      display: block;
+      font-size: 1.12rem;
+      margin-top: 4px;
+    }}
+    form, .actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin: 12px 0;
+    }}
+    label {{
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      color: #cfdae2;
+    }}
+    input[type="number"], select {{
+      color: #eef3f7;
+      background: #171e24;
+      border: 1px solid #34424d;
+      border-radius: 4px;
+      padding: 7px;
+    }}
+    input[type="number"] {{
+      width: 72px;
+    }}
+    button, a.button {{
+      color: #07100c;
+      background: #74d99f;
+      border: 0;
+      border-radius: 4px;
+      padding: 8px 12px;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      background: #171e24;
+      border: 1px solid #26313a;
+      border-radius: 6px;
+      overflow: hidden;
+    }}
+    th, td {{
+      text-align: left;
+      border-bottom: 1px solid #26313a;
+      padding: 9px 10px;
+      vertical-align: top;
+    }}
+    th {{
+      width: 34%;
+      color: #9bacb8;
+      font-weight: 500;
+    }}
+    .hint {{
+      color: #f0c36d;
+      background: #2d2614;
+      border: 1px solid #59491f;
+      border-radius: 6px;
+      padding: 10px;
+    }}
+    @media (max-width: 700px) {{
+      header {{ align-items: flex-start; flex-direction: column; }}
+      .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    }}
+  </style>
+  <script>
+    async function refreshTargets() {{
+      const select = document.querySelector('select[name="target"]');
+      if (!select) return;
+      const current = select.value;
+      const response = await fetch('/targets.json', {{ cache: 'no-store' }});
+      if (!response.ok) return;
+      const data = await response.json();
+      select.innerHTML = '';
+      const none = document.createElement('option');
+      none.value = '';
+      none.textContent = 'None (Static)';
+      select.appendChild(none);
+      for (const target of data.targets || []) {{
+        const option = document.createElement('option');
+        option.value = target.id;
+        option.textContent = target.label;
+        select.appendChild(option);
+      }}
+      select.value = current || data.selected || '';
+    }}
+    window.addEventListener('load', () => {{
+      refreshTargets();
+      setInterval(refreshTargets, 1000);
+    }});
+  </script>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>DroneAI <span class="live-badge">● LIVE</span></h1>
+        <p class="sub">{html.escape(DRONE_CONFIG["name"])} / {html.escape(DRONE_CONFIG["model"])}</p>
+      </div>
+      <a class="button" href="/snapshot.jpg?{query}">Open JPEG</a>
+    </header>
+
+    <!-- Continuous MJPEG live stream -->
+    <img class="frame" src="/stream?{query}" alt="Live camera feed">
+
+    <section class="metrics">
+      <div class="metric"><span class="label">Altitude</span><span class="value">{telemetry["altitude"]} m</span></div>
+      <div class="metric"><span class="label">Speed</span><span class="value">{telemetry["speed"]} m/s</span></div>
+      <div class="metric"><span class="label">Battery</span><span class="value">{telemetry["battery"]}%</span></div>
+      <div class="metric"><span class="label">Signal</span><span class="value">{telemetry["signal_strength"]}%</span></div>
+    </section>
+
+    <form method="get" action="/">
+      <label>Confidence <input type="number" name="conf" min="0.10" max="1.00" step="0.05" value="{confidence:.2f}"></label>
+      <label>Track Target: 
+        <select name="target">
+          {target_options}
+        </select>
+      </label>
+      <button type="submit">Apply</button>
+      <a class="button" href="/reset">Reset camera</a>
+    </form>
+
+    {hint_html}
+    <table>{rows}</table>
+  </main>
+</body>
+</html>"""
+    return body.encode("utf-8")
+
+
+# ── HTTP request handler ───────────────────────────────────────
+
+class DroneRequestHandler(BaseHTTPRequestHandler):
+    server_version = "DroneAIHTTP/0.2"
+
+    def do_HEAD(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/":
+            self._send_headers(200, "text/html; charset=utf-8", 0)
+            return
+        if parsed.path == "/snapshot.jpg":
+            self._send_headers(200, "image/jpeg", 0, cache=False)
+            return
+        if parsed.path == "/targets.json":
+            self._send_headers(200, "application/json; charset=utf-8", 0, cache=False)
+            return
+        self._send_headers(404, "text/plain; charset=utf-8", 0)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+
+        if parsed.path == "/":
+            self._send(200, "text/html; charset=utf-8",
+                       _render_html(params))
+            return
+
+        if parsed.path == "/stream":
+            self._handle_stream(params)
+            return
+
+        if parsed.path == "/targets.json":
+            self._send(200, "application/json; charset=utf-8",
+                       _targets_payload(), cache=False)
+            return
+
+        if parsed.path == "/snapshot.jpg":
+            # Grab latest frame from the continuous loop
+            with _FRAME_LOCK:
+                jpeg = _LATEST_JPEG
+            if jpeg is None:
+                # Fallback: capture one frame directly
+                cam = _get_camera()
+                frame = get_camera_frame(cam)
+                if frame is None:
+                    frame = get_simulated_frame(VIDEO_WIDTH, VIDEO_HEIGHT)
+                jpeg = _jpeg_bytes(frame)
+            self._send(200, "image/jpeg", jpeg, cache=False)
+            return
+
+        if parsed.path == "/reset":
+            _reset_camera()
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
+
+        self._send(404, "text/plain; charset=utf-8", b"Not found")
+
+    def _handle_stream(self, params):
+        """Serve a continuous MJPEG stream.
+
+        The browser's <img src="/stream"> tag natively decodes
+        multipart/x-mixed-replace as a live video feed.
+        """
+        # Apply settings from query params
+        ai_enabled = AI_ENABLED
+        overlay_enabled = OVERLAY_ENABLED
+        confidence = _float_param(params, "conf", DEFAULT_CONFIDENCE)
+        
+        with _STREAM_SETTINGS_LOCK:
+            current_target = _STREAM_TARGET_ID
+        target_id = params.get("target", [current_target])[-1].strip()
+        
+        _update_stream_settings(ai_enabled, overlay_enabled, confidence, target_id)
+
+        boundary = b"--droneai_frame"
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "multipart/x-mixed-replace; boundary=droneai_frame",
+        )
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        try:
+            while _CAPTURE_RUNNING:
+                # Wait for a new frame (with timeout to check if stopped)
+                _FRAME_EVENT.wait(timeout=1.0)
+                _FRAME_EVENT.clear()
+
+                with _FRAME_LOCK:
+                    jpeg = _LATEST_JPEG
+                if jpeg is None:
+                    continue
+
+                # Send MJPEG frame
+                header = (
+                    boundary + b"\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n"
+                    b"\r\n"
+                )
+                self.wfile.write(header)
+                self.wfile.write(jpeg)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Client disconnected — this is normal
+            pass
+
+    def log_message(self, fmt, *args):
+        if os.getenv("DRONE_HTTP_LOG", "0") == "1":
+            super().log_message(fmt, *args)
+
+    def _send(self, status: int, content_type: str, data: bytes,
+              cache: bool = True):
+        self._send_headers(status, content_type, len(data), cache=cache)
+        self.wfile.write(data)
+
+    def _send_headers(self, status: int, content_type: str, length: int,
+                      cache: bool = True):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
+        if not cache:
+            self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+
+class DroneHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def _create_http_server():
+    candidates = [(HOST, PORT)]
+    if HOST in {"0.0.0.0", "::", ""}:
+        candidates.append(("127.0.0.1", PORT))
+    for port in range(PORT + 1, PORT + 6):
+        candidates.append((HOST, port))
+        if HOST in {"0.0.0.0", "::", ""}:
+            candidates.append(("127.0.0.1", port))
+
+    errors = []
+    seen = set()
+    for host, port in candidates:
+        key = (host, port)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            return DroneHTTPServer((host, port), DroneRequestHandler), host, port
+        except OSError as exc:
+            errors.append(f"{host}:{port} ({exc})")
+
+    details = "; ".join(errors) or "no bind attempts were made"
+    raise RuntimeError(f"Could not start DroneAI HTTP server: {details}")
+
+
+# ── Application entry point ────────────────────────────────────
 
 def main():
-    # ╔══════════════════════════════════════════════════════════════╗
-    # ║  PAGE CONFIG                                                 ║
-    # ╚══════════════════════════════════════════════════════════════╝
-    st.set_page_config(
-        page_title="DroneAI Command Center",
-        page_icon="🛸",
-        layout="wide",
-        initial_sidebar_state="expanded",
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    # ╔══════════════════════════════════════════════════════════════╗
-    # ║  CUSTOM CSS                                                  ║
-    # ╚══════════════════════════════════════════════════════════════╝
-    st.markdown("""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap');
+    try:
+        httpd, bound_host, bound_port = _create_http_server()
+    except RuntimeError as exc:
+        print(exc)
+        print("Try setting DRONE_UI_HOST=127.0.0.1 or DRONE_UI_PORT=8502, then run python app.py again.")
+        raise SystemExit(1) from exc
+
+    # Start camera capture only after the UI server is ready.
+    _start_capture_loop()
+
+    def shutdown(_signum=None, _frame=None):
+        _stop_capture_loop()
+        _reset_camera()
+        release_servo()
+        httpd.server_close()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    print(f"DroneAI live UI running at http://{bound_host}:{bound_port}")
+    print("Camera feed is streaming continuously with YOLO detection.")
+    try:
+        httpd.serve_forever()
+    finally:
+        _stop_capture_loop()
+        _reset_camera()
+        release_servo()
 
-    /* ── Global ──────────────────────────────────── */
-    html, body, .stApp {
-        font-family: 'Inter', sans-serif;
-    }
-
-    /* ── Header banner ───────────────────────────── */
-    .hero-banner {
-        background: linear-gradient(135deg, #0d1117 0%, #161b22 40%, #0d4429 100%);
-        border: 1px solid rgba(0,255,136,0.12);
-        border-radius: 14px;
-        padding: 1.6rem 2rem;
-        margin-bottom: 1.2rem;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
-    .hero-banner h1 {
-        color: #00ff88;
-        font-size: 1.7rem;
-        font-weight: 700;
-        margin: 0;
-        letter-spacing: -0.5px;
-    }
-    .hero-banner .subtitle {
-        color: #8b949e;
-        font-size: 0.88rem;
-        margin-top: 0.25rem;
-    }
-    .badge-online {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        background: rgba(0,255,136,0.1);
-        color: #00ff88;
-        border: 1px solid rgba(0,255,136,0.25);
-        padding: 5px 14px;
-        border-radius: 20px;
-        font-size: 0.78rem;
-        font-weight: 600;
-        letter-spacing: 0.4px;
-    }
-    .badge-online::before {
-        content: '';
-        width: 8px;
-        height: 8px;
-        background: #00ff88;
-        border-radius: 50%;
-        animation: pulse-dot 1.5s ease-in-out infinite;
-    }
-    @keyframes pulse-dot {
-        0%, 100% { opacity: 1; }
-        50%      { opacity: 0.35; }
-    }
-
-    /* ── Metric cards override ───────────────────── */
-    [data-testid="stMetric"] {
-        background: linear-gradient(135deg, #161b22 0%, #0d1117 100%);
-        border: 1px solid rgba(255,255,255,0.04);
-        border-radius: 10px;
-        padding: 14px 16px;
-    }
-    [data-testid="stMetricLabel"] {
-        color: #8b949e !important;
-        font-size: 0.78rem !important;
-        text-transform: uppercase;
-        letter-spacing: 0.8px;
-    }
-    [data-testid="stMetricValue"] {
-        color: #e6edf3 !important;
-        font-family: 'JetBrains Mono', monospace !important;
-        font-size: 1.35rem !important;
-    }
-
-    /* ── Tabs ────────────────────────────────────── */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 4px;
-        background: #0d1117;
-        border-radius: 10px;
-        padding: 4px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        border-radius: 8px;
-        color: #8b949e;
-        font-weight: 500;
-    }
-    .stTabs [data-baseweb="tab"][aria-selected="true"] {
-        background: #161b22;
-        color: #00ff88;
-    }
-
-    /* ── Sidebar ─────────────────────────────────── */
-    section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #0d1117 0%, #161b22 100%);
-    }
-    section[data-testid="stSidebar"] .stMarkdown h3,
-    section[data-testid="stSidebar"] .stMarkdown h4 {
-        color: #e6edf3;
-    }
-
-    /* ── Hide chrome ─────────────────────────────── */
-    #MainMenu, footer, header {visibility: hidden;}
-
-    /* ── Section dividers ────────────────────────── */
-    .section-title {
-        color: #e6edf3;
-        font-size: 1.05rem;
-        font-weight: 600;
-        margin-bottom: 0.6rem;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-    }
-
-    /* ── Detection chip ──────────────────────────── */
-    .det-chip {
-        display: inline-flex;
-        align-items: center;
-        gap: 5px;
-        padding: 4px 10px;
-        border-radius: 6px;
-        font-size: 0.82rem;
-        font-weight: 500;
-        margin-bottom: 4px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-
-    # ╔══════════════════════════════════════════════════════════════╗
-    # ║  SIDEBAR                                                     ║
-    # ╚══════════════════════════════════════════════════════════════╝
-    with st.sidebar:
-        st.markdown("### 🛸 DroneAI Control")
-        st.caption(f"{DRONE_CONFIG['name']}  ·  {DRONE_CONFIG['model']}")
-        st.markdown("---")
-
-        st.markdown("#### ⚙️ Mission Parameters")
-        max_altitude  = st.slider("Max Altitude (m)", 10, 120, 50)
-        max_speed     = st.slider("Max Speed (m/s)", 1, 15, 8)
-        flight_mode   = st.selectbox("Flight Mode", ["AUTO", "GUIDED", "LOITER", "RTL", "LAND"])
-
-        st.markdown("---")
-        st.markdown("#### 🎯 Detection Filters")
-        conf_threshold = st.slider("Min Confidence", 0.30, 1.0, DEFAULT_CONFIDENCE, 0.05)
-        detect_person  = st.checkbox("Person",  value=True)
-        detect_vehicle = st.checkbox("Vehicle", value=True)
-        detect_animal  = st.checkbox("Animal",  value=True)
-        detect_drone   = st.checkbox("Drone",   value=True)
-
-        st.markdown("---")
-        st.markdown("#### 📹 Camera Performance")
-        camera_profiles = {
-            "Lowest": (VIDEO_WIDTH, VIDEO_HEIGHT, CAMERA_FPS, CAMERA_INFERENCE_EVERY_N),
-            "Ultra Fast": (224, 168, 10, 6),
-            "Faster": (320, 240, 10, 4),
-            "Quality": (480, 360, 15, 2),
-        }
-        profile_name = st.selectbox("Camera Mode", list(camera_profiles), index=0)
-        stream_width, stream_height, stream_fps, infer_every_n = camera_profiles[profile_name]
-        st.caption(f"{stream_width}x{stream_height} @ {stream_fps} FPS  ·  AI every {infer_every_n} frame(s)")
-
-        st.markdown("---")
-        st.markdown("#### 🔄 Refresh")
-        auto_refresh = st.toggle("Live refresh", value=True)
-        refresh_interval = st.slider("Refresh interval (s)", 0.5, 5.0, float(REFRESH_INTERVAL), 0.25)
-        if st.button("↻  Refresh Now", width="stretch"):
-            st.rerun()
-
-
-    # ╔══════════════════════════════════════════════════════════════╗
-    # ║  HEADER                                                      ║
-    # ╚══════════════════════════════════════════════════════════════╝
-    st.markdown("""
-    <div class="hero-banner">
-        <div>
-            <h1>🛸 DroneAI Command Center</h1>
-            <div class="subtitle">Real-time Autonomous Surveillance  ·  Raspberry Pi 4 + ONNX Runtime</div>
-        </div>
-        <span class="badge-online">SYSTEM ONLINE</span>
-    </div>
-    """, unsafe_allow_html=True)
-
-
-    # ╔══════════════════════════════════════════════════════════════╗
-    # ║  TABS                                                        ║
-    # ╚══════════════════════════════════════════════════════════════╝
-    tab_overview, tab_feed, tab_detections, tab_analytics, tab_system = st.tabs(
-        ["📊 Overview", "📹 Live Feed", "🎯 Detections", "📈 Analytics", "🖥️ System"]
-    )
-
-    # ─── get shared data once ────────────────────────────────────────
-    telemetry  = get_telemetry_data()
-    model      = init_yolo_model()
-    live_dets  = pd.DataFrame(columns=["timestamp", "class", "confidence", "x", "y", "width", "height"])
-    summary    = get_detection_summary(live_dets)
-    st.session_state.setdefault("feed_frame_count", 0)
-    st.session_state.setdefault("last_live_dets", live_dets)
-
-
-    # ┌──────────────────────────────────────────────────────────────┐
-    # │  TAB 1 — Overview                                            │
-    # └──────────────────────────────────────────────────────────────┘
-    with tab_overview:
-        # -- top metrics ------------------------------------------------
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Altitude",   f"{telemetry['altitude']} m",    f"{np.random.uniform(-1.5, 1.5):.1f} m")
-        m2.metric("Speed",      f"{telemetry['speed']} m/s",     f"{np.random.uniform(-0.8, 0.8):.1f}")
-        m3.metric("Battery",    f"{telemetry['battery']}%",      f"-{np.random.uniform(0, 0.5):.1f}%")
-        m4.metric("Satellites", f"{telemetry['satellites']}",     None)
-        m5.metric("Signal",     f"{telemetry['signal_strength']}%", None)
-        m6.metric("Heading",    f"{telemetry['heading']}°",      None)
-
-        st.markdown("")
-
-        # -- map + info -------------------------------------------------
-        col_map, col_info = st.columns([2, 1])
-
-        with col_map:
-            st.markdown('<div class="section-title">🗺️ Drone Position</div>', unsafe_allow_html=True)
-            map_df = pd.DataFrame({
-                "lat": [telemetry["gps_lat"]],
-                "lon": [telemetry["gps_lon"]],
-            })
-            st.map(map_df, zoom=15, width="stretch")
-
-        with col_info:
-            st.markdown('<div class="section-title">📋 Flight Info</div>', unsafe_allow_html=True)
-
-            info_data = {
-                "Parameter": [
-                    "Flight Mode", "Armed", "Heading", "GPS Lat", "GPS Lon",
-                    "AI Runtime", "Model Backend", "Uptime",
-                ],
-                "Value": [
-                    flight_mode,
-                    "✅ Yes" if telemetry["armed"] else "❌ No",
-                    f"{telemetry['heading']}°",
-                    f"{telemetry['gps_lat']:.6f}",
-                    f"{telemetry['gps_lon']:.6f}",
-                    DRONE_CONFIG["ai_runtime"],
-                    get_model_backend(),
-                    f"{np.random.randint(5, 55)} min",
-                ],
-            }
-            st.table(pd.DataFrame(info_data))
-
-            st.markdown('<div class="section-title">🎯 Detections</div>', unsafe_allow_html=True)
-            for cls, cnt in summary.items():
-                color = DETECTION_COLORS.get(cls, "#888")
-                st.markdown(
-                    f'<span class="det-chip" style="background:{color}22;color:{color};border:1px solid {color}44">'
-                    f'{cls}: <b>{cnt}</b></span>',
-                    unsafe_allow_html=True,
-                )
-
-
-    # ┌──────────────────────────────────────────────────────────────┐
-    # │  TAB 2 — Live Feed                                           │
-    # └──────────────────────────────────────────────────────────────┘
-    with tab_feed:
-        col_cam, col_live_det = st.columns([2, 1])
-
-        live_dets = get_simulated_detection_data(8)
-
-        with col_cam:
-            # ── source toggle ──
-            if RPI_CAMERA_AVAILABLE:
-                st.markdown('<div class="section-title">📹 Live ArduCam IMX219-R Feed</div>', unsafe_allow_html=True)
-                cam = init_camera(width=stream_width, height=stream_height, fps=stream_fps)
-                frame = get_webcam_frame(cam)
-                if frame is not None:
-                    if model is not None:
-                        live_dets = update_live_detections(frame, model, conf_threshold, infer_every_n)
-                    else:
-                        st.warning(f"AI model unavailable ({get_model_backend()}), using simulated detections.")
-                        live_dets = get_simulated_detection_data(8)
-                        st.session_state.last_live_dets = live_dets
-
-                    frame = add_detection_overlay(frame, live_dets)
-                    st.image(frame, width="stretch")
-                else:
-                    st.error("⚠️ Unable to capture live ArduCam feed. Verify picamera2 installation and camera connection.")
-                    st.info("If the camera is attached to the Raspberry Pi, restart the app after installing picamera2.")
-            else:
-                use_webcam = st.toggle("📷 Use Laptop Webcam", value=True)
-
-                if use_webcam:
-                    st.markdown('<div class="section-title">📹 Live Webcam Feed</div>', unsafe_allow_html=True)
-                    cam = init_camera(width=stream_width, height=stream_height, fps=stream_fps)
-                    frame = get_webcam_frame(cam)
-                    if frame is not None:
-                        if model is not None:
-                            live_dets = update_live_detections(frame, model, conf_threshold, infer_every_n)
-                        else:
-                            st.warning(f"AI model unavailable ({get_model_backend()}), using simulated detections.")
-                            live_dets = get_simulated_detection_data(8)
-                            st.session_state.last_live_dets = live_dets
-
-                        frame = add_detection_overlay(frame, live_dets)
-                        st.image(frame, width="stretch")
-                    else:
-                        st.error("⚠️ Webcam capture failed. Ensure a webcam is connected and not in use by another app.")
-                        st.markdown('<div class="section-title">📹 Camera Feed (Simulated)</div>', unsafe_allow_html=True)
-                        frame = get_simulated_frame()
-                        live_dets = get_simulated_detection_data(8)
-                        st.image(frame, width="stretch")
-                else:
-                    st.markdown('<div class="section-title">📹 Camera Feed (Simulated)</div>', unsafe_allow_html=True)
-                    frame = get_simulated_frame()
-                    live_dets = get_simulated_detection_data(8)
-                    st.image(frame, width="stretch")
-            # controls
-            c1, c2, c3, c4 = st.columns(4)
-            c1.button("📸 Capture",    width="stretch")
-            c2.button("⏺️ Record",     width="stretch")
-            c3.button("🔍 Zoom In",    width="stretch")
-            c4.button("🌙 Night Mode", width="stretch")
-
-        with col_live_det:
-            st.markdown('<div class="section-title">🎯 Live Detections</div>', unsafe_allow_html=True)
-            for _, row in live_dets.iterrows():
-                icon = "🟢" if row["confidence"] > 0.85 else ("🟡" if row["confidence"] > 0.70 else "🔴")
-                color = DETECTION_COLORS.get(row["class"], "#888")
-                st.markdown(
-                    f'{icon} **{row["class"]}** — `{row["confidence"]:.0%}`',
-                )
-                st.caption(f'Pos ({row["x"]}, {row["y"]})  ·  Size {row["width"]}×{row["height"]}')
-                st.markdown("---")
-
-            if live_dets.empty:
-                st.info("No detections were found on the current frame.")
-
-
-    detections = live_dets if not live_dets.empty else get_simulated_detection_data(30)
-    summary = get_detection_summary(detections)
-
-
-    # ┌──────────────────────────────────────────────────────────────┐
-    # │  TAB 3 — Detections                                          │
-    # └──────────────────────────────────────────────────────────────┘
-    with tab_detections:
-        d_col1, d_col2 = st.columns(2)
-
-        with d_col1:
-            fig_pie = px.pie(
-                values=list(summary.values()),
-                names=list(summary.keys()),
-                title="Detection Distribution",
-                hole=0.45,
-                color=list(summary.keys()),
-                color_discrete_map=DETECTION_COLORS,
-            )
-            fig_pie.update_layout(
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-                font_color="#8b949e",
-                title_font_color="#e6edf3",
-                legend_font_color="#8b949e",
-            )
-            st.plotly_chart(fig_pie, width="stretch")
-
-        with d_col2:
-            fig_hist = px.histogram(
-                detections,
-                x="confidence",
-                nbins=15,
-                title="Confidence Distribution",
-                color_discrete_sequence=["#00ff88"],
-            )
-            fig_hist.update_layout(
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-                font_color="#8b949e",
-                title_font_color="#e6edf3",
-                xaxis_title="Confidence",
-                yaxis_title="Count",
-            )
-            st.plotly_chart(fig_hist, width="stretch")
-
-        # -- detection timeline -----------------------------------------
-        st.markdown('<div class="section-title">📋 Detection Log</div>', unsafe_allow_html=True)
-
-        # filter by active classes
-        active_classes = []
-        if detect_person:  active_classes.append("Person")
-        if detect_vehicle: active_classes.append("Vehicle")
-        if detect_animal:  active_classes.append("Animal")
-        if detect_drone:   active_classes.append("Drone")
-        active_classes.append("Unknown")
-
-        filtered = detections[
-            (detections["class"].isin(active_classes)) &
-            (detections["confidence"] >= conf_threshold)
-        ].sort_values("timestamp", ascending=False)
-
-        st.table(filtered)
-        st.caption(f"Showing {len(filtered)} of {len(detections)} detections (confidence ≥ {conf_threshold:.0%})")
-
-
-    # ┌──────────────────────────────────────────────────────────────┐
-    # │  TAB 4 — Analytics                                           │
-    # └──────────────────────────────────────────────────────────────┘
-    with tab_analytics:
-        history = get_telemetry_history(30)
-
-        CHART_LAYOUT = dict(
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            font_color="#8b949e",
-            title_font_color="#e6edf3",
-            xaxis=dict(gridcolor="rgba(255,255,255,0.04)"),
-            yaxis=dict(gridcolor="rgba(255,255,255,0.04)"),
-            margin=dict(l=10, r=10, t=40, b=10),
-        )
-
-        a1, a2 = st.columns(2)
-
-        with a1:
-            fig = px.area(history, x="timestamp", y="altitude", title="Altitude (m)",
-                           color_discrete_sequence=["#00ff88"])
-            fig.update_layout(**CHART_LAYOUT)
-            st.plotly_chart(fig, width="stretch")
-
-        with a2:
-            fig = px.line(history, x="timestamp", y="speed", title="Speed (m/s)",
-                          color_discrete_sequence=["#4d96ff"])
-            fig.update_layout(**CHART_LAYOUT)
-            st.plotly_chart(fig, width="stretch")
-
-        a3, a4 = st.columns(2)
-
-        with a3:
-            fig = px.area(history, x="timestamp", y="battery", title="Battery (%)",
-                          color_discrete_sequence=["#ffd93d"])
-            fig.update_layout(**CHART_LAYOUT)
-            fig.update_yaxes(range=[0, 100])
-            st.plotly_chart(fig, width="stretch")
-
-        with a4:
-            fig = px.line(history, x="timestamp", y="temperature", title="Temperature (°C)",
-                          color_discrete_sequence=["#ff6b6b"])
-            fig.update_layout(**CHART_LAYOUT)
-            st.plotly_chart(fig, width="stretch")
-
-        # -- detection trend (bar) --------------------------------------
-        st.markdown('<div class="section-title">🎯 Detection Counts by Class</div>', unsafe_allow_html=True)
-        bar_data = pd.DataFrame({
-            "Class": list(summary.keys()),
-            "Count": list(summary.values()),
-        })
-        fig_bar = px.bar(
-            bar_data, x="Class", y="Count",
-            color="Class",
-            color_discrete_map=DETECTION_COLORS,
-            title="Current Session Detections",
-        )
-        fig_bar.update_layout(**CHART_LAYOUT, showlegend=False)
-        st.plotly_chart(fig_bar, width="stretch")
-
-
-    # ┌──────────────────────────────────────────────────────────────┐
-    # │  TAB 5 — System                                              │
-    # └──────────────────────────────────────────────────────────────┘
-    with tab_system:
-        s1, s2 = st.columns(2)
-
-        with s1:
-            st.markdown('<div class="section-title">🖥️ Hardware Info</div>', unsafe_allow_html=True)
-            hw = pd.DataFrame({
-                "Component": [
-                    "Processor", "AI Accelerator", "Camera",
-                    "Flight Controller", "Battery", "Max Altitude", "Max Speed",
-                ],
-                "Specification": [
-                    DRONE_CONFIG["processor"],
-                    DRONE_CONFIG["ai_accelerator"],
-                    DRONE_CONFIG["camera"],
-                    DRONE_CONFIG["flight_controller"],
-                    f"{DRONE_CONFIG['battery_capacity']} mAh",
-                    f"{DRONE_CONFIG['max_altitude']} m",
-                    f"{DRONE_CONFIG['max_speed']} m/s",
-                ],
-            })
-            st.table(hw)
-
-        with s2:
-            st.markdown('<div class="section-title">📊 System Resources</div>', unsafe_allow_html=True)
-            if psutil is not None:
-                cpu_usage = int(psutil.cpu_percent(interval=0.1))
-                ram_usage = int(psutil.virtual_memory().percent)
-                disk_usage = int(psutil.disk_usage("/").percent)
-                try:
-                    temp = psutil.sensors_temperatures().get("cpu_thermal", [None])[0]
-                    cpu_temp = f"{temp.current:.1f}°C" if temp is not None else "N/A"
-                except Exception:
-                    cpu_temp = "N/A"
-            else:
-                cpu_usage = np.random.randint(35, 65)
-                ram_usage = np.random.randint(40, 70)
-                disk_usage = np.random.randint(25, 50)
-                cpu_temp = "N/A"
-
-            res1, res2 = st.columns(2)
-            res1.metric("CPU", f"{cpu_usage}%")
-            res2.metric("RAM", f"{ram_usage}%")
-
-            res3, res4 = st.columns(2)
-            res3.metric("Disk", f"{disk_usage}%")
-            res4.metric("CPU Temp", cpu_temp)
-
-            st.markdown("")
-            st.markdown('<div class="section-title">📡 Network</div>', unsafe_allow_html=True)
-            net = pd.DataFrame({
-                "Metric": ["Latency", "Bandwidth", "Packet Loss", "Protocol"],
-                "Value": [
-                    f"{np.random.randint(8, 35)} ms",
-                    f"{np.random.uniform(5, 15):.1f} Mbps",
-                    f"{np.random.uniform(0, 0.5):.2f}%",
-                    "MAVLink v2 / UDP",
-                ],
-            })
-            st.table(net)
-
-
-    # ╔══════════════════════════════════════════════════════════════╗
-    # ║  AUTO REFRESH                                                ║
-    # ╚══════════════════════════════════════════════════════════════╝
-    if auto_refresh:
-        time.sleep(refresh_interval)
-        st.rerun()
 
 if __name__ == "__main__":
     main()

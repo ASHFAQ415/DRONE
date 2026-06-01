@@ -5,25 +5,19 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "droneai-command-center"
 version = "0.1.0"
-description = "DroneAI Command Center — Streamlit-powered dashboard for autonomous drone telemetry and object detection."
+description = "Lightweight drone operator UI for telemetry snapshots and object detection."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [ { name = "DroneAI Team" } ]
-keywords = ["drone", "streamlit", "object detection", "telemetry", "surveillance"]
+keywords = ["drone", "object detection", "telemetry", "surveillance"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Framework :: Streamlit",
     "License :: OSI Approved :: MIT License",
     "Environment :: Web Environment",
 ]
 dependencies = [
-    "streamlit>=1.50.0",
-    "plotly>=5.18.0",
-    "pandas>=2.0.0,<3.0",
     "numpy>=1.24.0,<2.3",
-    "folium>=0.15.0",
-    "streamlit-folium>=0.15.0",
     "Pillow>=10.0.0",
     "opencv-python-headless>=4.8.0,<4.12.0",
     "pymavlink>=2.4.40",

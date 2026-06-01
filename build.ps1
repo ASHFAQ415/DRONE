@@ -8,4 +8,4 @@ Write-Host "Building wheel package..."
 python -m pip install --upgrade setuptools wheel
 python -m pip install -e .
 
-Write-Host "Build complete. Run the dashboard with: droneai or streamlit run app.py"
+Write-Host "Build complete. Run the lightweight UI with: droneai or python app.py"

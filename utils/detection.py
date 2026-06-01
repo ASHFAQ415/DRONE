@@ -3,67 +3,267 @@ Detection helpers with Raspberry Pi friendly YOLO inference.
 
 Runtime prefers an exported ONNX model through onnxruntime. Ultralytics is kept
 optional so Raspberry Pi deployments do not need to import torch just to run.
+
+Integrates ideas from Object_Detection_Files:
+  - Class filtering (object-ident-2.py style objects=['cup'] param)
+  - Servo actuation on target detection (object-ident-3.py style)
 """
 
+import logging
 import numpy as np
-import pandas as pd
 import os
 from datetime import datetime, timedelta
 
-from config import DETECTION_CLASSES, VIDEO_WIDTH, VIDEO_HEIGHT, MODEL_PATH, MODEL_INPUT_SIZE
+from config import (
+    DETECTION_CLASSES, VIDEO_WIDTH, VIDEO_HEIGHT,
+    MODEL_PATH, MODEL_INPUT_SIZE, TARGET_OBJECTS,
+)
 
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
-
-try:
-    import onnxruntime as ort
-    ONNX_AVAILABLE = True
-except ImportError:
-    ort = None
-    ONNX_AVAILABLE = False
+logger = logging.getLogger(__name__)
 
 _MODEL = None
 _MODEL_BACKEND = "simulated"
+_ORT = None
+_YOLO = None
 
 COCO_NAMES = {
     0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 4: "airplane",
-    5: "bus", 6: "train", 7: "truck", 8: "boat", 14: "bird", 15: "cat",
-    16: "dog", 17: "horse", 18: "sheep", 19: "cow", 20: "elephant",
-    21: "bear", 22: "zebra", 23: "giraffe",
+    5: "bus", 6: "train", 7: "truck", 8: "boat", 9: "traffic light",
+    10: "fire hydrant", 11: "stop sign", 12: "parking meter", 13: "bench",
+    14: "bird", 15: "cat", 16: "dog", 17: "horse", 18: "sheep",
+    19: "cow", 20: "elephant", 21: "bear", 22: "zebra", 23: "giraffe",
+    24: "backpack", 25: "umbrella", 26: "handbag", 27: "tie",
+    28: "suitcase", 29: "frisbee", 30: "skis", 31: "snowboard",
+    32: "sports ball", 33: "kite", 34: "baseball bat", 35: "baseball glove",
+    36: "skateboard", 37: "surfboard", 38: "tennis racket", 39: "bottle",
+    40: "wine glass", 41: "cup", 42: "fork", 43: "knife", 44: "spoon",
+    45: "bowl", 46: "banana", 47: "apple", 48: "sandwich", 49: "orange",
+    50: "broccoli", 51: "carrot", 52: "hot dog", 53: "pizza", 54: "donut",
+    55: "cake", 56: "chair", 57: "couch", 58: "potted plant", 59: "bed",
+    60: "dining table", 61: "toilet", 62: "tv", 63: "laptop", 64: "mouse",
+    65: "remote", 66: "keyboard", 67: "cell phone", 68: "microwave",
+    69: "oven", 70: "toaster", 71: "sink", 72: "refrigerator", 73: "book",
+    74: "clock", 75: "vase", 76: "scissors", 77: "teddy bear",
+    78: "hair drier", 79: "toothbrush",
 }
 
-CLASS_MAP = {
-    "person": "Person",
-    "car": "Vehicle",
-    "truck": "Vehicle",
-    "bus": "Vehicle",
-    "bicycle": "Vehicle",
-    "motorcycle": "Vehicle",
-    "train": "Vehicle",
-    "boat": "Vehicle",
-    "airplane": "Drone",
-    "bird": "Animal",
-    "cat": "Animal",
-    "dog": "Animal",
-    "horse": "Animal",
-    "sheep": "Animal",
-    "cow": "Animal",
-    "elephant": "Animal",
-    "bear": "Animal",
-    "zebra": "Animal",
-    "giraffe": "Animal",
-}
+PERSON_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+TRACKABLE_CLASSES = {"Person", "Animal", "Vehicle", "Drone", "Building"}
+
+
+def _target_label(class_name: str, index: int) -> str:
+    """Return stable operator labels: Person A, Animal B, Vehicle AA, ..."""
+    letters = []
+    index += 1
+    while index:
+        index, remainder = divmod(index - 1, len(PERSON_LABELS))
+        letters.append(PERSON_LABELS[remainder])
+    return f"{class_name} {''.join(reversed(letters))}"
+
+
+class PersonTargetTracker:
+    """Assign stable target labels to trackable detections across frames."""
+
+    def __init__(self, max_missing: int = 12, max_distance: float = 140.0,
+                 locked_max_missing: int = 120):
+        self.max_missing = max_missing
+        self.max_distance = max_distance
+        self.locked_max_missing = locked_max_missing
+        self._tracks = {}
+        self._next_indices = {}
+
+    def update(self, detections: list[dict], locked_target_id: str = "") -> list[dict]:
+        annotated = [d.copy() for d in detections]
+        target_indices = [
+            index for index, det in enumerate(annotated)
+            if det.get("class") in TRACKABLE_CLASSES
+        ]
+
+        if not target_indices:
+            for track in self._tracks.values():
+                track["missing"] += 1
+            self._prune_missing(locked_target_id)
+            return annotated
+
+        centers = {
+            index: self._center(annotated[index])
+            for index in target_indices
+        }
+        matches = self._match_existing_tracks(centers, annotated)
+        matches = self._match_locked_target(
+            matches, annotated, target_indices, locked_target_id
+        )
+        matched_tracks = set(matches)
+        matched_detections = set(matches.values())
+
+        for track_id, det_index in matches.items():
+            self._update_track(track_id, annotated[det_index])
+            self._annotate_detection(annotated[det_index], self._tracks[track_id])
+
+        for track_id, track in self._tracks.items():
+            if track_id not in matched_tracks:
+                track["missing"] += 1
+
+        for det_index in sorted(set(target_indices) - matched_detections,
+                                key=lambda i: (annotated[i].get("x", 0), annotated[i].get("y", 0))):
+            track_id = self._create_track(annotated[det_index])
+            self._annotate_detection(annotated[det_index], self._tracks[track_id])
+
+        self._prune_missing(locked_target_id)
+        return annotated
+
+    def _match_existing_tracks(self, centers: dict[int, tuple[float, float]],
+                               detections: list[dict]) -> dict[str, int]:
+        candidates = []
+        for track_id, track in self._tracks.items():
+            tx, ty = track["center"]
+            for det_index, (cx, cy) in centers.items():
+                if track.get("class") != detections[det_index].get("class"):
+                    continue
+                distance = float(np.hypot(cx - tx, cy - ty))
+                if distance <= self.max_distance:
+                    candidates.append((distance, track_id, det_index))
+
+        matches = {}
+        used_tracks = set()
+        used_detections = set()
+        for _distance, track_id, det_index in sorted(candidates):
+            if track_id in used_tracks or det_index in used_detections:
+                continue
+            matches[track_id] = det_index
+            used_tracks.add(track_id)
+            used_detections.add(det_index)
+        return matches
+
+    def _match_locked_target(self, matches: dict[str, int], annotated: list[dict],
+                             target_indices: list[int], locked_target_id: str) -> dict[str, int]:
+        if not locked_target_id or locked_target_id in matches:
+            return matches
+
+        locked_class = self._class_from_track_id(locked_target_id)
+        locked_indices = [
+            index for index in target_indices
+            if annotated[index].get("class") == locked_class
+        ] if locked_class else target_indices
+
+        if len(locked_indices) == 1:
+            det_index = locked_indices[0]
+            for track_id, matched_det_index in list(matches.items()):
+                if matched_det_index == det_index:
+                    del matches[track_id]
+                    break
+            if locked_target_id not in self._tracks:
+                self._create_track(annotated[det_index], track_id=locked_target_id)
+            matches[locked_target_id] = det_index
+            return matches
+
+        matched_detections = set(matches.values())
+        unmatched_targets = sorted(
+            set(locked_indices) - matched_detections,
+            key=lambda i: float(annotated[i].get("confidence", 0)),
+            reverse=True,
+        )
+        if len(unmatched_targets) != 1:
+            return matches
+
+        det_index = unmatched_targets[0]
+        if locked_target_id not in self._tracks:
+            self._create_track(annotated[det_index], track_id=locked_target_id)
+        matches[locked_target_id] = det_index
+        return matches
+
+    def _create_track(self, detection: dict, track_id: str = "") -> str:
+        class_name = detection.get("class", "Target")
+        if track_id:
+            label = self._label_from_track_id(track_id)
+            class_name = self._class_from_track_id(track_id) or class_name
+        else:
+            next_index = self._next_indices.get(class_name, 0)
+            label = _target_label(class_name, next_index)
+            track_id = f"{class_name.lower()}_{label.split()[-1].lower()}"
+            self._next_indices[class_name] = next_index + 1
+        self._tracks[track_id] = {
+            "id": track_id,
+            "label": label,
+            "class": class_name,
+            "center": self._center(detection),
+            "missing": 0,
+        }
+        return track_id
+
+    def _update_track(self, track_id: str, detection: dict) -> None:
+        track = self._tracks[track_id]
+        old_x, old_y = track["center"]
+        new_x, new_y = self._center(detection)
+        track["center"] = ((old_x * 0.35) + (new_x * 0.65),
+                           (old_y * 0.35) + (new_y * 0.65))
+        track["missing"] = 0
+
+    def _annotate_detection(self, detection: dict, track: dict) -> None:
+        detection["target_id"] = track["id"]
+        detection["target_label"] = track["label"]
+
+    def _prune_missing(self, locked_target_id: str = "") -> None:
+        stale = [
+            track_id for track_id, track in self._tracks.items()
+            if track["missing"] > (
+                self.locked_max_missing
+                if track_id == locked_target_id
+                else self.max_missing
+            )
+        ]
+        for track_id in stale:
+            del self._tracks[track_id]
+
+    @staticmethod
+    def _label_from_track_id(track_id: str) -> str:
+        parts = track_id.split("_", 1)
+        if len(parts) == 2:
+            class_name, suffix = parts
+        else:
+            class_name, suffix = "target", track_id
+        return f"{class_name.title()} {suffix.replace('_', '').upper() or '?'}"
+
+    @staticmethod
+    def _class_from_track_id(track_id: str) -> str:
+        prefix = track_id.split("_", 1)[0].strip()
+        return prefix.title() if prefix else ""
+
+    @staticmethod
+    def _center(detection: dict) -> tuple[float, float]:
+        return (
+            float(detection.get("x", 0)) + float(detection.get("width", 0)) / 2.0,
+            float(detection.get("y", 0)) + float(detection.get("height", 0)) / 2.0,
+        )
+
+# ── Object Detection ──────────────────────────────────────────
+def _map_class(coco_name: str) -> str:
+    """Map COCO dataset names to DroneAI classes suitable for aerial tracking."""
+    c = coco_name.strip().lower()
+    
+    if c == "person":
+        return "Person"
+
+    if c in {"building", "house", "roof", "tower"}:
+        return "Building"
+        
+    if c in {"car", "truck", "bus", "bicycle", "motorcycle", "train", "boat"}:
+        return "Vehicle"
+        
+    if c in {"airplane", "kite"}:
+        return "Drone"
+        
+    if c in {"bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"}:
+        return "Animal"
+        
+    return c
 
 
 class OnnxYoloModel:
     """Small YOLOv8 ONNX wrapper that avoids torch/ultralytics at runtime."""
 
     def __init__(self, model_path: str, input_size: int = MODEL_INPUT_SIZE):
-        if not ONNX_AVAILABLE:
-            raise ImportError("onnxruntime package is not installed")
+        ort = _load_onnxruntime()
         providers = ["CPUExecutionProvider"]
         self.session = ort.InferenceSession(model_path, providers=providers)
         self.input_name = self.session.get_inputs()[0].name
@@ -109,8 +309,7 @@ def load_yolo_model(model_path: str | None = None):
         return _MODEL
 
     if configured_path.endswith(".pt"):
-        if not YOLO_AVAILABLE:
-            raise ImportError("ultralytics package is not installed")
+        YOLO = _load_ultralytics()
         _MODEL = YOLO(configured_path)
         _MODEL_BACKEND = "Ultralytics"
         return _MODEL
@@ -118,12 +317,35 @@ def load_yolo_model(model_path: str | None = None):
     raise ValueError(f"Unsupported model format: {configured_path}")
 
 
+def _load_onnxruntime():
+    """Import ONNX Runtime only when live AI is enabled."""
+    global _ORT
+    if _ORT is None:
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise ImportError("onnxruntime package is not installed") from exc
+        _ORT = ort
+    return _ORT
+
+
+def _load_ultralytics():
+    """Import Ultralytics only for .pt development models."""
+    global _YOLO
+    if _YOLO is None:
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise ImportError("ultralytics package is not installed") from exc
+        _YOLO = YOLO
+    return _YOLO
+
+
 def get_model_backend() -> str:
     return _MODEL_BACKEND
 
 
-def _map_class(name: str) -> str:
-    return CLASS_MAP.get(name.lower(), "Unknown")
+
 
 
 def _to_numpy(frame):
@@ -254,26 +476,60 @@ def _parse_yolo_results(results, conf_threshold: float):
     return rows
 
 
-def infer_detections(frame, model=None, conf_threshold: float = 0.30) -> pd.DataFrame:
-    """Run inference on a camera frame and return detection records."""
+def filter_detections(detections: list[dict],
+                      objects: list[str] | None = None) -> list[dict]:
+    """Filter detections to only include specified target classes.
+
+    Mirrors the object-ident-2.py / object-ident-3.py pattern:
+        getObjects(img, 0.45, 0.2, objects=['cup', 'horse'])
+
+    If *objects* is empty or None, all detections pass through
+    (same as the original object-ident.py behaviour).
+    """
+    if not objects:
+        return detections
+    return [d for d in detections if d.get("class") in objects]
+
+
+def infer_detections(frame, model=None, conf_threshold: float = 0.30,
+                     objects: list[str] | None = None) -> list[dict]:
+    """Run inference on a camera frame and return detection records.
+
+    Args:
+        frame:          Camera frame (PIL Image or numpy array).
+        model:          Loaded YOLO model (ONNX or Ultralytics).
+        conf_threshold: Minimum confidence to keep a detection.
+        objects:        Optional list of class names to keep.
+                        Mirrors object-ident-2/3's objects parameter.
+                        Defaults to config.TARGET_OBJECTS if None.
+    """
     if model is None:
-        return get_simulated_detection_data(8)
+        return []
     if frame is None:
-        return pd.DataFrame(columns=["timestamp", "class", "confidence", "x", "y", "width", "height"])
+        return []
+
+    # Use configured target objects when caller doesn't specify
+    if objects is None:
+        objects = TARGET_OBJECTS
 
     try:
         if isinstance(model, OnnxYoloModel):
             rows = model.predict(frame, conf_threshold)
         else:
             image = _to_numpy(frame)
-            results = model(image, conf=conf_threshold, imgsz=MODEL_INPUT_SIZE, verbose=False)
+            results = model(image, conf=conf_threshold,
+                            imgsz=MODEL_INPUT_SIZE, verbose=False)
             rows = _parse_yolo_results(results, conf_threshold)
-        return pd.DataFrame(rows)
+
+        # Apply class filter (object-ident-2/3 style)
+        rows = filter_detections(rows, objects)
+
+        return rows
     except Exception:
-        return get_simulated_detection_data(8)
+        return []
 
 
-def get_simulated_detection_data(n: int = 20) -> pd.DataFrame:
+def get_simulated_detection_data(n: int = 20) -> list[dict]:
     """Generate *n* simulated detection records."""
     now = datetime.now()
     rows = []
@@ -282,26 +538,32 @@ def get_simulated_detection_data(n: int = 20) -> pd.DataFrame:
         h = int(np.random.randint(30, 200))
         rows.append({
             "timestamp":  now - timedelta(seconds=int(i * np.random.randint(5, 30))),
-            "class":      np.random.choice(DETECTION_CLASSES, p=[0.40, 0.30, 0.15, 0.05, 0.10]),
+            "class":      np.random.choice(
+                ["Person", "Vehicle", "Animal", "Drone", "mouse",
+                 "laptop", "cup", "cell phone", "backpack", "Unknown"]
+            ),
             "confidence": round(float(np.random.uniform(0.55, 0.99)), 2),
             "x":          int(np.random.randint(0, max(1, VIDEO_WIDTH - w))),
             "y":          int(np.random.randint(0, max(1, VIDEO_HEIGHT - h))),
             "width":      w,
             "height":     h,
         })
-    return pd.DataFrame(rows)
+    return rows
 
 
-def get_detection_summary(detections: pd.DataFrame) -> dict:
-    """Return total counts per class for a detection DataFrame."""
+def get_detection_summary(detections) -> dict:
+    """Return total counts per class for detection records."""
     summary = {cls: 0 for cls in DETECTION_CLASSES}
-    if detections is None or detections.empty:
+    if not detections:
         return summary
 
-    counts = detections["class"].value_counts().to_dict()
-    for cls, count in counts.items():
+    if hasattr(detections, "to_dict"):
+        detections = detections.to_dict("records")
+
+    for row in detections:
+        cls = row.get("class", "Unknown") if isinstance(row, dict) else "Unknown"
         if cls in summary:
-            summary[cls] = int(count)
+            summary[cls] += 1
         else:
-            summary["Unknown"] += int(count)
+            summary["Unknown"] += 1
     return summary
