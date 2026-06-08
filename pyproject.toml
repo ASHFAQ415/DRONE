@@ -23,6 +23,8 @@ dependencies = [
     "pymavlink>=2.4.40",
     "onnxruntime>=1.17.0",
     "psutil>=5.9.0",
+    "gpiozero>=2.0.1",
+    "lgpio>=0.2.2.0",
 ]
 
 [project.scripts]
